@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>mtaco</title>
+<style>
+  :root {
+    --bg-0: #070809;
+    --bg-1: #0c0e14;
+    --hint: rgba(180, 192, 214, 0.34);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: var(--bg-0);
+    cursor: crosshair;
+  }
+  #stage {
+    display: block;
+    width: 100vw; height: 100vh;
+    background:
+      radial-gradient(120% 120% at 50% 42%, var(--bg-1) 0%, var(--bg-0) 70%);
+    touch-action: none;
+  }
+  #hint {
+    position: fixed;
+    left: 50%; bottom: 5.2vh;
+    transform: translateX(-50%);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.42em;
+    text-transform: uppercase;
+    color: var(--hint);
+    pointer-events: none;
+    user-select: none;
+    transition: opacity 1.1s ease;
+    text-indent: 0.42em;
+  }
+  #hint.gone { opacity: 0; }
+  @media (prefers-reduced-motion: reduce) {
+    #hint { transition: none; }
+  }
+</style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <div id="hint">move to surface</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+  const hint = document.getElementById("hint");
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---- Tunables ---------------------------------------------------------
+  let TILE_W = 70;              // full diamond width (px) — set responsively in build()
+  let TILE_H = 35;              // 2:1 isometric
+  const INSET = 0.86;           // top-face shrink -> visible gaps between cells
+  const CORNER = 7;             // rounded corner radius of top face
+  const BASE_THICK = 5;         // resting cell thickness (always extruded a touch)
+
+  const SIGMA = 132;            // reveal radius of the pointer (px)
+  const MAX_LIFT = 30;          // peak rise for ordinary tiles
+  const TEXT_MULT = 2.55;       // text tiles rise this much higher
+  const AMB_AMP = reduceMotion ? 0 : 2.2; // ambient breathing amplitude
+
+  // Palette (rgb triplets)
+  const TOP_BASE   = [31, 35, 46];   // slate cell top at rest
+  const TOP_BRIGHT = [70, 80, 102];  // brightened by proximity
+  // The hidden word lights up in one accent, picked at random on each load.
+  const ACCENTS = [
+    [110, 231, 255], // cyan
+    [125, 240, 175], // mint
+    [167, 139, 250], // violet
+    [255, 138, 110], // coral
+    [250, 204, 90],  // amber
+    [244, 130, 200], // pink
+  ];
+  const ACCENT = ACCENTS[(Math.random() * ACCENTS.length) | 0];
+  // Ordinary tiles brighten toward this accent-tinted slate near the pointer, so
+  // the ambient glow picks up the chosen accent instead of always reading blue.
+  const TOP_GLOW = mix(TOP_BRIGHT, ACCENT, 0.42);
+  const BLACK      = [0, 0, 0];       // wall shading mixes top colour toward this
+  const FACE_L = 0.52;               // left face darkness multiplier
+  const FACE_R = 0.74;               // right face (catches the light)
+
+  // ---- Glyphs (7 rows tall, '#' = filled tile) --------------------------
+  const GLYPHS = {
+    m: [
+      "........",
+      "........",
+      "########",
+      "##.##.##",
+      "##.##.##",
+      "##.##.##",
+      "##.##.##",
+    ],
+    t: [
+      ".##..",
+      ".##..",
+      "#####",
+      ".##..",
+      ".##..",
+      ".##..",
+      ".###.",
+    ],
+    a: [
+      "......",
+      "......",
+      ".####.",
+      "....##",
+      ".#####",
+      "##..##",
+      ".#####",
+    ],
+    c: [
+      "......",
+      "......",
+      ".####.",
+      "##..##",
+      "##....",
+      "##..##",
+      ".####.",
+    ],
+    o: [
+      "......",
+      "......",
+      ".####.",
+      "##..##",
+      "##..##",
+      "##..##",
+      ".####.",
+    ],
+  };
+  const WORD = "mtaco";
+  const GLYPH_ROWS = 7;
+  const LETTER_GAP = 1;
+
+  // Build the set of text cells in "letter space": (row r, column C across word)
+  const textCells = [];           // {r, c}
+  let wordCols = 0;
+  {
+    let cursor = 0;
+    for (const ch of WORD) {
+      const g = GLYPHS[ch];
+      const w = g[0].length;
+      for (let r = 0; r < GLYPH_ROWS; r++) {
+        const line = g[r];
+        for (let x = 0; x < w; x++) {
+          if (line[x] === "#") textCells.push({ r, c: cursor + x });
+        }
+      }
+      cursor += w + LETTER_GAP;
+    }
+    wordCols = cursor - LETTER_GAP;
+  }
+
+  // ---- State ------------------------------------------------------------
+  let W = 0, H = 0, dpr = 1;
+  let originX = 0, originY = 0;
+  let tiles = [];                 // flat list, draw-sorted back-to-front
+  let textSet = null;             // Set of "gx,gy" keys
+  const pointer = { x: -1e5, y: -1e5, inside: false };
+  let interacted = false;
+
+  // Map letter-space (r, C) to grid coords so the word runs up the diagonal:
+  //   increasing C  -> grid -gy  (reads up-right on screen)
+  //   increasing r  -> grid +gx  (letter top is higher on screen)
+  // Centre the word on the grid origin.
+  const GX0 = -Math.floor(GLYPH_ROWS / 2);
+  const GY0 = Math.floor(wordCols / 2);
+
+  function buildTextSet() {
+    textSet = new Set();
+    for (const { r, c } of textCells) {
+      const gx = GX0 + r;
+      const gy = GY0 - c;
+      textSet.add(gx + "," + gy);
+    }
+  }
+
+  function projectX(gx, gy) { return originX + (gx - gy) * (TILE_W / 2); }
+  function projectY(gx, gy) { return originY + (gx + gy) * (TILE_H / 2); }
+
+  function build() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+
+    // Size tiles so the full word fits along its bottom-left -> top-right diagonal.
+    // Screen extents:  width  ~= TILE_W * span,  height ~= TILE_H * span = TILE_W/2 * span
+    // where span = wordCols/2 (diagonal run) + GLYPH_ROWS/2 (letter depth).
+    const span = wordCols * 0.5 + GLYPH_ROWS * 0.5;
+    const byWidth = (W * 0.92) / span;
+    const byHeight = (H * 0.92) / (0.5 * span);
+    TILE_W = Math.max(34, Math.min(82, Math.min(byWidth, byHeight)));
+    TILE_H = TILE_W * 0.5;
+    hw = (TILE_W / 2) * INSET;
+    hh = (TILE_H / 2) * INSET;
+    computeGeom();
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    originX = W / 2;
+    originY = H / 2;
+
+    // Determine the grid range that covers the viewport (+margin), by
+    // inverting the projection at the four screen corners.
+    const margin = TILE_W * 1.5 + MAX_LIFT * TEXT_MULT;
+    let minGX = Infinity, maxGX = -Infinity, minGY = Infinity, maxGY = -Infinity;
+    const corners = [
+      [-margin, -margin], [W + margin, -margin],
+      [-margin, H + margin], [W + margin, H + margin],
+    ];
+    for (const [sx, sy] of corners) {
+      const a = (sx - originX) / (TILE_W / 2); // gx - gy
+      const b = (sy - originY) / (TILE_H / 2); // gx + gy
+      const gx = (a + b) / 2;
+      const gy = (b - a) / 2;
+      minGX = Math.min(minGX, gx); maxGX = Math.max(maxGX, gx);
+      minGY = Math.min(minGY, gy); maxGY = Math.max(maxGY, gy);
+    }
+    minGX = Math.floor(minGX) - 1; maxGX = Math.ceil(maxGX) + 1;
+    minGY = Math.floor(minGY) - 1; maxGY = Math.ceil(maxGY) + 1;
+
+    buildTextSet();
+
+    tiles = [];
+    for (let gx = minGX; gx <= maxGX; gx++) {
+      for (let gy = minGY; gy <= maxGY; gy++) {
+        const sx = projectX(gx, gy);
+        const sy = projectY(gx, gy);
+        if (sx < -margin || sx > W + margin || sy < -margin || sy > H + margin) continue;
+        tiles.push({
+          gx, gy, sx, sy,
+          depth: gx + gy,
+          isText: textSet.has(gx + "," + gy),
+          h: 0,        // current eased height
+        });
+      }
+    }
+    // Painter's algorithm: far (small depth) first, near last.
+    tiles.sort((p, q) => p.depth - q.depth || p.sx - q.sx);
+  }
+
+  // ---- Drawing helpers --------------------------------------------------
+  let hw = (TILE_W / 2) * INSET;
+  let hh = (TILE_H / 2) * INSET;
+
+  // Rounded-corner tangent points, relative to a tile's centre. hw/hh are the
+  // same for every tile, so we compute these once per build (see computeGeom).
+  // Corners run Top, Right, Bottom, Left; pN are the points where each rounded
+  // corner meets its incoming (1) / outgoing (2) edge. The walls reuse the same
+  // front-edge tangents as the top face, so they can never overshoot it.
+  let G = null;
+  function computeGeom() {
+    const len = Math.hypot(hw, hh) || 1;
+    const rr = Math.min(CORNER, len * 0.5);
+    const ux = hw / len, uy = hh / len; // unit step along a diamond edge
+    const T = [0, -hh], R = [hw, 0], B = [0, hh], L = [-hw, 0];
+    // Tangent points where each rounded corner meets its incoming(1)/outgoing(2) edge.
+    const p1T = [T[0] - ux * rr, T[1] + uy * rr], p2T = [T[0] + ux * rr, T[1] + uy * rr];
+    const p1R = [R[0] - ux * rr, R[1] - uy * rr], p2R = [R[0] - ux * rr, R[1] + uy * rr];
+    const p1B = [B[0] + ux * rr, B[1] - uy * rr], p2B = [B[0] - ux * rr, B[1] - uy * rr];
+    const p1L = [L[0] + ux * rr, L[1] + uy * rr], p2L = [L[0] + ux * rr, L[1] - uy * rr];
+
+    // The walls must extrude from the silhouette EXTREMES (the apex of each side
+    // corner arc), not the tangent points — otherwise the rounded top overhangs
+    // the narrower walls ("piston" look). Split each lower corner arc at its apex
+    // (the t=0.5 point of the quadratic) so the walls wrap the corner down to the
+    // true left/right/bottom extent. mid() gives the control point of a half-arc.
+    const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const apex = (a, c, b) => [0.25 * a[0] + 0.5 * c[0] + 0.25 * b[0],
+                               0.25 * a[1] + 0.5 * c[1] + 0.25 * b[1]];
+
+    G = {
+      T, R, B, L,
+      p1T, p2T, p1R, p2R, p1B, p2B, p1L, p2L,
+      apexR: apex(p1R, R, p2R), ctrlR2: mid(R, p2R), // R corner: apex -> p2R
+      apexB: apex(p1B, B, p2B), ctrlBr: mid(p1B, B), ctrlBl: mid(B, p2B), // B split at apex
+      apexL: apex(p1L, L, p2L), ctrlL1: mid(p1L, L), // L corner: p1L -> apex
+    };
+  }
+
+  function rgb(c) { return "rgb(" + (c[0] | 0) + "," + (c[1] | 0) + "," + (c[2] | 0) + ")"; }
+  function mix(a, b, t) {
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  }
+
+  function drawTile(t, top, lift) {
+    const cx = t.sx;
+    const cy = t.sy - lift;       // centre of the top face
+    const thick = lift + BASE_THICK;
+    const g = G;
+
+    // Right wall — runs from the right extreme (apexR) around the lower-right
+    // edge to the bottom extreme (apexB). Top edge matches the top face exactly;
+    // bottom edge is the same curve dropped by `thick`, so widths line up.
+    ctx.fillStyle = rgb(mix(top, BLACK, 1 - FACE_R));
+    ctx.beginPath();
+    ctx.moveTo(cx + g.apexR[0], cy + g.apexR[1]);
+    ctx.quadraticCurveTo(cx + g.ctrlR2[0], cy + g.ctrlR2[1], cx + g.p2R[0], cy + g.p2R[1]);
+    ctx.lineTo(cx + g.p1B[0], cy + g.p1B[1]);
+    ctx.quadraticCurveTo(cx + g.ctrlBr[0], cy + g.ctrlBr[1], cx + g.apexB[0], cy + g.apexB[1]);
+    ctx.lineTo(cx + g.apexB[0], cy + g.apexB[1] + thick);
+    ctx.quadraticCurveTo(cx + g.ctrlBr[0], cy + g.ctrlBr[1] + thick, cx + g.p1B[0], cy + g.p1B[1] + thick);
+    ctx.lineTo(cx + g.p2R[0], cy + g.p2R[1] + thick);
+    ctx.quadraticCurveTo(cx + g.ctrlR2[0], cy + g.ctrlR2[1] + thick, cx + g.apexR[0], cy + g.apexR[1] + thick);
+    ctx.closePath();
+    ctx.fill();
+
+    // Left wall — from the bottom extreme (apexB) around the lower-left edge to
+    // the left extreme (apexL). Shares the vertical seam at apexB with the right wall.
+    ctx.fillStyle = rgb(mix(top, BLACK, 1 - FACE_L));
+    ctx.beginPath();
+    ctx.moveTo(cx + g.apexB[0], cy + g.apexB[1]);
+    ctx.quadraticCurveTo(cx + g.ctrlBl[0], cy + g.ctrlBl[1], cx + g.p2B[0], cy + g.p2B[1]);
+    ctx.lineTo(cx + g.p1L[0], cy + g.p1L[1]);
+    ctx.quadraticCurveTo(cx + g.ctrlL1[0], cy + g.ctrlL1[1], cx + g.apexL[0], cy + g.apexL[1]);
+    ctx.lineTo(cx + g.apexL[0], cy + g.apexL[1] + thick);
+    ctx.quadraticCurveTo(cx + g.ctrlL1[0], cy + g.ctrlL1[1] + thick, cx + g.p1L[0], cy + g.p1L[1] + thick);
+    ctx.lineTo(cx + g.p2B[0], cy + g.p2B[1] + thick);
+    ctx.quadraticCurveTo(cx + g.ctrlBl[0], cy + g.ctrlBl[1] + thick, cx + g.apexB[0], cy + g.apexB[1] + thick);
+    ctx.closePath();
+    ctx.fill();
+
+    // Top face — same rounded outline the walls were traced from.
+    ctx.fillStyle = rgb(top);
+    ctx.beginPath();
+    ctx.moveTo(cx + g.p1T[0], cy + g.p1T[1]);
+    ctx.quadraticCurveTo(cx + g.T[0], cy + g.T[1], cx + g.p2T[0], cy + g.p2T[1]);
+    ctx.lineTo(cx + g.p1R[0], cy + g.p1R[1]);
+    ctx.quadraticCurveTo(cx + g.R[0], cy + g.R[1], cx + g.p2R[0], cy + g.p2R[1]);
+    ctx.lineTo(cx + g.p1B[0], cy + g.p1B[1]);
+    ctx.quadraticCurveTo(cx + g.B[0], cy + g.B[1], cx + g.p2B[0], cy + g.p2B[1]);
+    ctx.lineTo(cx + g.p1L[0], cy + g.p1L[1]);
+    ctx.quadraticCurveTo(cx + g.L[0], cy + g.L[1], cx + g.p2L[0], cy + g.p2L[1]);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---- Animation loop ---------------------------------------------------
+  const inv2Sigma2 = 1 / (2 * SIGMA * SIGMA);
+
+  function frame(now) {
+    const time = now || 0;
+    const px = pointer.x, py = pointer.y;
+    const pActive = pointer.inside;
+
+    ctx.clearRect(0, 0, W, H);
+
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i];
+
+      // ambient breathing — lifts text and ground equally, so it never leaks the word
+      const amb = AMB_AMP * Math.sin((t.gx + t.gy) * 0.45 + time * 0.0013);
+
+      let prox = 0;
+      if (pActive) {
+        const dx = t.sx - px, dy = t.sy - py;
+        prox = Math.exp(-(dx * dx + dy * dy) * inv2Sigma2); // 0..1
+      }
+
+      const mult = t.isText ? TEXT_MULT : 1;
+      const target = amb + prox * MAX_LIFT * mult;
+
+      // ease toward target
+      t.h += (target - t.h) * 0.18;
+
+      // colour: ground brightens slightly with proximity; text tiles swing to accent
+      let top;
+      if (t.isText) {
+        const reveal = Math.min(1, prox * 1.35);
+        top = mix(mix(TOP_BASE, TOP_GLOW, prox * 0.4), ACCENT, reveal * reveal);
+      } else {
+        top = mix(TOP_BASE, TOP_GLOW, prox * 0.55);
+      }
+
+      drawTile(t, top, t.h < 0 ? Math.max(t.h, -BASE_THICK + 1) : t.h);
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Input ------------------------------------------------------------
+  function setPointer(x, y) {
+    pointer.x = x; pointer.y = y; pointer.inside = true;
+    if (!interacted) {
+      interacted = true;
+      hint.classList.add("gone");
+    }
+  }
+  window.addEventListener("pointermove", (e) => setPointer(e.clientX, e.clientY), { passive: true });
+  window.addEventListener("pointerdown", (e) => setPointer(e.clientX, e.clientY), { passive: true });
+  window.addEventListener("pointerleave", () => { pointer.inside = false; });
+  window.addEventListener("blur", () => { pointer.inside = false; });
+
+  // ---- Boot -------------------------------------------------------------
+  let resizeRaf = 0;
+  window.addEventListener("resize", () => {
+    cancelAnimationFrame(resizeRaf);
+    resizeRaf = requestAnimationFrame(build);
+  });
+
+  build();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
