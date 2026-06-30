@@ -4,6 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>mtaco</title>
+<link rel="icon" type="image/png" href="favicon.png" />
+<link rel="apple-touch-icon" href="favicon.png" />
 <style>
   :root {
     --bg-0: #070809;
@@ -404,6 +406,23 @@
   window.addEventListener("pointerleave", () => { pointer.inside = false; });
   window.addEventListener("blur", () => { pointer.inside = false; });
 
+  // ---- Tab dressing: decoding title -------------------------------------
+
+  // Braille spinners flanking the title, spinning in opposite directions:
+  // "⠏ mtaco ⠹". Static for reduced-motion users.
+  function spinTitle() {
+    const TITLE = "mtaco";
+    if (reduceMotion) { document.title = TITLE; return; }
+    const F = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const n = F.length;
+    let i = 0;
+    setInterval(() => {
+      const k = i % n;
+      document.title = F[k] + " " + TITLE + " " + F[n - 1 - k];
+      i++;
+    }, 90);
+  }
+
   // ---- Boot -------------------------------------------------------------
   let resizeRaf = 0;
   window.addEventListener("resize", () => {
@@ -412,6 +431,7 @@
   });
 
   build();
+  spinTitle();
   requestAnimationFrame(frame);
 })();
 </script>
