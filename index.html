@@ -17,7 +17,7 @@
     width: 100%; height: 100%;
     overflow: hidden;
     background: var(--bg-0);
-    cursor: crosshair;
+    cursor: default;
   }
   #stage {
     display: block;
@@ -71,6 +71,7 @@
   const MAX_LIFT = 30;          // peak rise for ordinary tiles
   const TEXT_MULT = 2.55;       // text tiles rise this much higher
   const AMB_AMP = reduceMotion ? 0 : 2.2; // ambient breathing amplitude
+  const POINTER_FADE_MS = reduceMotion ? 1 : 180;
   const ACCENT_FADE_MS = reduceMotion ? 1 : 760;
   const SWITCH_FADE_MS = reduceMotion ? 1 : 520;
   const SWITCH_REVEAL_MULT = 1.45;
@@ -177,7 +178,7 @@
   let textSet = null;             // Set of "gx,gy" keys
   let textTiles = [];
   let switchTiles = [];
-  const pointer = { x: -1e5, y: -1e5, inside: false };
+  const pointer = { x: -1e5, y: -1e5, inside: false, strength: 0 };
   let interacted = false;
   let lastFrameTime = 0;
 
@@ -554,10 +555,13 @@
     const time = now || 0;
     const dt = lastFrameTime ? Math.min(64, time - lastFrameTime) : 16.7;
     lastFrameTime = time;
-    const px = pointer.x, py = pointer.y;
-    const pActive = pointer.inside;
 
     updateAccentFade(dt);
+    updatePointerFade(dt);
+
+    const px = pointer.x, py = pointer.y;
+    const pStrength = pointer.strength;
+    const pActive = pStrength > 0.001;
 
     ctx.clearRect(0, 0, W, H);
 
@@ -583,12 +587,12 @@
       let prox = 0;
       if (pActive) {
         const dx = t.sx - px, dy = t.sy - py;
-        prox = Math.exp(-(dx * dx + dy * dy) * inv2Sigma2); // 0..1
+        prox = Math.exp(-(dx * dx + dy * dy) * inv2Sigma2) * pStrength; // 0..1
       }
 
       const mult = t.isText ? TEXT_MULT : 1;
       let target = amb + prox * MAX_LIFT * mult;
-      if (sw && !sw.removing && pActive && isSwitchHovered(t, px, py)) target += SWITCH_HOVER_LIFT;
+      if (sw && !sw.removing && pointer.inside && isSwitchHovered(t, px, py)) target += SWITCH_HOVER_LIFT;
 
       // ease toward target
       t.h += (target - t.h) * 0.18;
@@ -667,19 +671,48 @@
   }
 
   function setPointer(x, y) {
-    pointer.x = x; pointer.y = y; pointer.inside = true;
+    pointer.x = x; pointer.y = y; pointer.inside = true; pointer.strength = 1;
+    updateCursor(x, y);
     if (!interacted) {
       interacted = true;
       hint.classList.add("gone");
     }
   }
+  function clearPointer() {
+    pointer.inside = false;
+    canvas.style.cursor = "default";
+  }
+  function updateCursor(x, y) {
+    canvas.style.cursor = pickSwitchTile(x, y) ? "pointer" : "default";
+  }
+  function updatePointerFade(dt) {
+    if (pointer.inside) {
+      pointer.strength = 1;
+      return;
+    }
+    if (pointer.strength <= 0) return;
+    pointer.strength = Math.max(0, pointer.strength - dt / POINTER_FADE_MS);
+    if (pointer.strength === 0) {
+      pointer.x = -1e5;
+      pointer.y = -1e5;
+    }
+  }
+  function clearPointerIfLeavingWindow(e) {
+    if (!e.relatedTarget && !e.toElement) clearPointer();
+  }
   window.addEventListener("pointermove", (e) => setPointer(e.clientX, e.clientY), { passive: true });
   window.addEventListener("pointerdown", (e) => {
     setPointer(e.clientX, e.clientY);
     activateSwitchTile(pickSwitchTile(e.clientX, e.clientY));
+    updateCursor(e.clientX, e.clientY);
   }, { passive: true });
-  window.addEventListener("pointerleave", () => { pointer.inside = false; });
-  window.addEventListener("blur", () => { pointer.inside = false; });
+  canvas.addEventListener("pointerleave", clearPointer, { passive: true });
+  document.documentElement.addEventListener("mouseleave", clearPointer, { passive: true });
+  window.addEventListener("pointerleave", clearPointer, { passive: true });
+  window.addEventListener("pointerout", clearPointerIfLeavingWindow, { passive: true });
+  window.addEventListener("mouseout", clearPointerIfLeavingWindow, { passive: true });
+  window.addEventListener("pointercancel", clearPointer, { passive: true });
+  window.addEventListener("blur", clearPointer);
 
   // ---- Tab dressing: decoding title -------------------------------------
 
