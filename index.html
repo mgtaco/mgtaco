@@ -201,6 +201,38 @@
   function projectX(gx, gy) { return originX + (gx - gy) * (TILE_W / 2); }
   function projectY(gx, gy) { return originY + (gx + gy) * (TILE_H / 2); }
 
+  function measureTextBounds(tileW) {
+    const tileH = tileW * 0.5;
+    const halfW = (tileW / 2) * INSET;
+    const halfH = (tileH / 2) * INSET;
+    const maxLift = MAX_LIFT * TEXT_MULT + AMB_AMP;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+    for (const { r, c } of textCells) {
+      const gx = GX0 + r;
+      const gy = GY0 - c;
+      const sx = (gx - gy) * (tileW / 2);
+      const sy = (gx + gy) * (tileH / 2);
+      minX = Math.min(minX, sx - halfW);
+      maxX = Math.max(maxX, sx + halfW);
+      minY = Math.min(minY, sy - halfH - maxLift);
+      maxY = Math.max(maxY, sy + halfH + BASE_THICK);
+    }
+
+    return { minX, maxX, minY, maxY, width: maxX - minX, height: maxY - minY };
+  }
+
+  function fitTextTileWidth(tileW) {
+    let fitted = tileW;
+    for (let i = 0; i < 4; i++) {
+      const bounds = measureTextBounds(fitted);
+      const scale = Math.min(1, (W * 0.9) / bounds.width, (H * 0.86) / bounds.height);
+      if (scale > 0.995) break;
+      fitted = Math.max(8, fitted * scale);
+    }
+    return fitted;
+  }
+
   function build() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth;
@@ -212,7 +244,7 @@
     const span = wordCols * 0.5 + GLYPH_ROWS * 0.5;
     const byWidth = (W * 0.92) / span;
     const byHeight = (H * 0.92) / (0.5 * span);
-    TILE_W = Math.max(34, Math.min(82, Math.min(byWidth, byHeight)));
+    TILE_W = fitTextTileWidth(Math.min(82, Math.min(byWidth, byHeight)));
     TILE_H = TILE_W * 0.5;
     hw = (TILE_W / 2) * INSET;
     hh = (TILE_H / 2) * INSET;
@@ -223,8 +255,9 @@
     canvas.style.height = H + "px";
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    originX = W / 2;
-    originY = H / 2;
+    const textBounds = measureTextBounds(TILE_W);
+    originX = W / 2 - (textBounds.minX + textBounds.maxX) / 2;
+    originY = H / 2 - (textBounds.minY + textBounds.maxY) / 2;
 
     // Determine the grid range that covers the viewport (+margin), by
     // inverting the projection at the four screen corners.
@@ -657,8 +690,8 @@
     if (reduceMotion) { document.title = TITLE; return; }
     const BRAILLE_BASE = 0x2800;
     const F = [
-      "⠉⠁", "⠈⠉", "⠀⠙", "⠀⠸", "⠀⢰", "⠀⣠",
-      "⢀⣀", "⣀⡀", "⣄⠀", "⡆⠀", "⠇⠀", "⠋⠀",
+      "⠉⠀", "⠈⠁", "⠀⠉", "⠀⠙", "⠀⠸", "⠀⢰", "⠀⣠",
+      "⠀⣀", "⢀⡀", "⣀⠀", "⣄⠀", "⡆⠀", "⠇⠀", "⠋⠀",
     ];
     const mergeCell = (a, b) =>
       String.fromCharCode(BRAILLE_BASE + ((a.charCodeAt(0) - BRAILLE_BASE) | (b.charCodeAt(0) - BRAILLE_BASE)));
