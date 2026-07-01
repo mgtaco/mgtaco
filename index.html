@@ -71,6 +71,10 @@
   const MAX_LIFT = 30;          // peak rise for ordinary tiles
   const TEXT_MULT = 2.55;       // text tiles rise this much higher
   const AMB_AMP = reduceMotion ? 0 : 2.2; // ambient breathing amplitude
+  const ACCENT_FADE_MS = reduceMotion ? 1 : 760;
+  const SWITCH_FADE_MS = reduceMotion ? 1 : 520;
+  const SWITCH_REVEAL_MULT = 1.45;
+  const SWITCH_HOVER_LIFT = 8;
 
   // Palette (rgb triplets)
   const TOP_BASE   = [31, 35, 46];   // slate cell top at rest
@@ -84,10 +88,12 @@
     [250, 204, 90],  // amber
     [244, 130, 200], // pink
   ];
-  const ACCENT = ACCENTS[(Math.random() * ACCENTS.length) | 0];
+  let activeAccentIndex = (Math.random() * ACCENTS.length) | 0;
+  let ACCENT = ACCENTS[activeAccentIndex].slice();
+  let accentFade = null;
   // Ordinary tiles brighten toward this accent-tinted slate near the pointer, so
   // the ambient glow picks up the chosen accent instead of always reading blue.
-  const TOP_GLOW = mix(TOP_BRIGHT, ACCENT, 0.42);
+  let TOP_GLOW = mix(TOP_BRIGHT, ACCENT, 0.42);
   const BLACK      = [0, 0, 0];       // wall shading mixes top colour toward this
   const FACE_L = 0.52;               // left face darkness multiplier
   const FACE_R = 0.74;               // right face (catches the light)
@@ -167,9 +173,13 @@
   let W = 0, H = 0, dpr = 1;
   let originX = 0, originY = 0;
   let tiles = [];                 // flat list, draw-sorted back-to-front
+  let tileByKey = new Map();
   let textSet = null;             // Set of "gx,gy" keys
+  let textTiles = [];
+  let switchTiles = [];
   const pointer = { x: -1e5, y: -1e5, inside: false };
   let interacted = false;
+  let lastFrameTime = 0;
 
   // Map letter-space (r, C) to grid coords so the word runs up the diagonal:
   //   increasing C  -> grid -gy  (reads up-right on screen)
@@ -183,10 +193,11 @@
     for (const { r, c } of textCells) {
       const gx = GX0 + r;
       const gy = GY0 - c;
-      textSet.add(gx + "," + gy);
+      textSet.add(tileKey(gx, gy));
     }
   }
 
+  function tileKey(gx, gy) { return gx + "," + gy; }
   function projectX(gx, gy) { return originX + (gx - gy) * (TILE_W / 2); }
   function projectY(gx, gy) { return originY + (gx + gy) * (TILE_H / 2); }
 
@@ -237,21 +248,162 @@
     buildTextSet();
 
     tiles = [];
+    tileByKey = new Map();
+    textTiles = [];
     for (let gx = minGX; gx <= maxGX; gx++) {
       for (let gy = minGY; gy <= maxGY; gy++) {
         const sx = projectX(gx, gy);
         const sy = projectY(gx, gy);
         if (sx < -margin || sx > W + margin || sy < -margin || sy > H + margin) continue;
-        tiles.push({
+        const key = tileKey(gx, gy);
+        const isText = textSet.has(key);
+        const tile = {
           gx, gy, sx, sy,
           depth: gx + gy,
-          isText: textSet.has(gx + "," + gy),
+          isText,
+          switchTile: null,
           h: 0,        // current eased height
-        });
+        };
+        tiles.push(tile);
+        tileByKey.set(key, tile);
+
+        if (isText) textTiles.push(tile);
       }
     }
     // Painter's algorithm: far (small depth) first, near last.
     tiles.sort((p, q) => p.depth - q.depth || p.sx - q.sx);
+    rebuildSwitchTiles();
+  }
+
+  function setActiveAccent(index) {
+    activeAccentIndex = index;
+    if (ACCENT_FADE_MS <= 1) {
+      setRenderedAccent(ACCENTS[activeAccentIndex]);
+      accentFade = null;
+      return;
+    }
+    accentFade = {
+      from: ACCENT.slice(),
+      to: ACCENTS[activeAccentIndex],
+      elapsed: 0,
+      duration: ACCENT_FADE_MS,
+    };
+  }
+
+  function setRenderedAccent(color) {
+    ACCENT = color.slice();
+    TOP_GLOW = mix(TOP_BRIGHT, ACCENT, 0.42);
+  }
+
+  function updateAccentFade(dt) {
+    if (!accentFade) return;
+    accentFade.elapsed += dt;
+    const p = Math.min(1, accentFade.elapsed / accentFade.duration);
+    const eased = p * p * (3 - 2 * p);
+    setRenderedAccent(mix(accentFade.from, accentFade.to, eased));
+    if (p >= 1) {
+      setRenderedAccent(ACCENTS[activeAccentIndex]);
+      accentFade = null;
+    }
+  }
+
+  function rebuildSwitchTiles() {
+    switchTiles = [];
+    for (let i = 0; i < ACCENTS.length; i++) {
+      if (i === activeAccentIndex) continue;
+      addSwitchTile(i, switchTiles);
+    }
+    syncSwitchTiles();
+  }
+
+  function addSwitchTile(accentIndex, avoid) {
+    const spot = findSwitchSpot(avoid);
+    if (!spot) return null;
+    const switchTile = {
+      accentIndex,
+      gx: spot.gx,
+      gy: spot.gy,
+      sx: spot.sx,
+      sy: spot.sy,
+      fade: 1,
+      removing: false,
+    };
+    switchTiles.push(switchTile);
+    return switchTile;
+  }
+
+  function syncSwitchTiles() {
+    for (const t of tiles) t.switchTile = null;
+    for (const sw of switchTiles) {
+      const tile = tileByKey.get(tileKey(sw.gx, sw.gy));
+      if (!tile) continue;
+      sw.sx = tile.sx;
+      sw.sy = tile.sy;
+      sw.depth = tile.depth;
+      tile.switchTile = sw;
+    }
+  }
+
+  function findSwitchSpot(avoid) {
+    const edgePad = Math.max(120, TILE_W * 1.6);
+    const textPad = Math.max(120, TILE_W * 2.0);
+    const tilePad = Math.max(162, TILE_W * 2.35);
+    const relax = [1, 0.84, 0.68, 0.52];
+
+    for (const r of relax) {
+      for (let i = 0; i < 1400; i++) {
+        const t = tiles[(Math.random() * tiles.length) | 0];
+        if (isSwitchCandidate(t, avoid, edgePad * r, textPad * r, tilePad * r)) return t;
+      }
+    }
+
+    let best = null;
+    let bestScore = -Infinity;
+    for (const t of tiles) {
+      if (!t || t.isText) continue;
+      const edgeClear = Math.min(t.sx, W - t.sx, t.sy, H - t.sy);
+      const textClear = Math.sqrt(distToTextSq(t.sx, t.sy));
+      let switchClear = Infinity;
+      for (const sw of avoid) {
+        if (sw.gx === t.gx && sw.gy === t.gy) { switchClear = 0; break; }
+        switchClear = Math.min(switchClear, Math.sqrt(distSq(t.sx, t.sy, sw.sx, sw.sy)));
+      }
+      const score = Math.min(edgeClear, textClear, switchClear) + Math.random();
+      if (score > bestScore) {
+        bestScore = score;
+        best = t;
+      }
+    }
+    return best;
+  }
+
+  function isSwitchCandidate(t, avoid, edgePad, textPad, tilePad) {
+    if (!t || t.isText) return false;
+    if (t.sx < edgePad || t.sx > W - edgePad || t.sy < edgePad || t.sy > H - edgePad) return false;
+    if (distToTextSq(t.sx, t.sy) < textPad * textPad) return false;
+    for (const sw of avoid) {
+      if (sw.gx === t.gx && sw.gy === t.gy) return false;
+      if (distSq(t.sx, t.sy, sw.sx, sw.sy) < tilePad * tilePad) return false;
+    }
+    return true;
+  }
+
+  function distToTextSq(x, y) {
+    if (!textTiles.length) return Infinity;
+    let nearest = Infinity;
+    const padX = TILE_W * 0.6;
+    const padY = TILE_H * 0.9;
+    for (const t of textTiles) {
+      const dx = Math.max(0, Math.abs(x - t.sx) - padX);
+      const dy = Math.max(0, Math.abs(y - t.sy) - padY);
+      nearest = Math.min(nearest, dx * dx + dy * dy);
+    }
+    return nearest;
+  }
+
+  function distSq(ax, ay, bx, by) {
+    const dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
   }
 
   // ---- Drawing helpers --------------------------------------------------
@@ -294,11 +446,14 @@
   }
 
   function rgb(c) { return "rgb(" + (c[0] | 0) + "," + (c[1] | 0) + "," + (c[2] | 0) + ")"; }
+  function rgba(c, a) {
+    return "rgba(" + (c[0] | 0) + "," + (c[1] | 0) + "," + (c[2] | 0) + "," + a + ")";
+  }
   function mix(a, b, t) {
     return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
   }
 
-  function drawTile(t, top, lift) {
+  function drawTile(t, top, lift, glowColor, glowStrength) {
     const cx = t.sx;
     const cy = t.sy - lift;       // centre of the top face
     const thick = lift + BASE_THICK;
@@ -336,6 +491,14 @@
     ctx.fill();
 
     // Top face — same rounded outline the walls were traced from.
+    const hasGlow = glowColor && glowStrength > 0.01;
+    if (hasGlow) {
+      ctx.save();
+      ctx.shadowColor = rgba(glowColor, 0.34 * glowStrength);
+      ctx.shadowBlur = 18 * glowStrength;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 0;
+    }
     ctx.fillStyle = rgb(top);
     ctx.beginPath();
     ctx.moveTo(cx + g.p1T[0], cy + g.p1T[1]);
@@ -348,6 +511,7 @@
     ctx.quadraticCurveTo(cx + g.L[0], cy + g.L[1], cx + g.p2L[0], cy + g.p2L[1]);
     ctx.closePath();
     ctx.fill();
+    if (hasGlow) ctx.restore();
   }
 
   // ---- Animation loop ---------------------------------------------------
@@ -355,13 +519,30 @@
 
   function frame(now) {
     const time = now || 0;
+    const dt = lastFrameTime ? Math.min(64, time - lastFrameTime) : 16.7;
+    lastFrameTime = time;
     const px = pointer.x, py = pointer.y;
     const pActive = pointer.inside;
 
+    updateAccentFade(dt);
+
     ctx.clearRect(0, 0, W, H);
+
+    let removedSwitchTile = false;
+    for (let i = switchTiles.length - 1; i >= 0; i--) {
+      const sw = switchTiles[i];
+      if (!sw.removing) continue;
+      sw.fade -= dt / SWITCH_FADE_MS;
+      if (sw.fade <= 0) {
+        switchTiles.splice(i, 1);
+        removedSwitchTile = true;
+      }
+    }
+    if (removedSwitchTile) syncSwitchTiles();
 
     for (let i = 0; i < tiles.length; i++) {
       const t = tiles[i];
+      const sw = t.switchTile;
 
       // ambient breathing — lifts text and ground equally, so it never leaks the word
       const amb = AMB_AMP * Math.sin((t.gx + t.gy) * 0.45 + time * 0.0013);
@@ -373,7 +554,8 @@
       }
 
       const mult = t.isText ? TEXT_MULT : 1;
-      const target = amb + prox * MAX_LIFT * mult;
+      let target = amb + prox * MAX_LIFT * mult;
+      if (sw && !sw.removing && pActive && isSwitchHovered(t, px, py)) target += SWITCH_HOVER_LIFT;
 
       // ease toward target
       t.h += (target - t.h) * 0.18;
@@ -387,13 +569,70 @@
         top = mix(TOP_BASE, TOP_GLOW, prox * 0.55);
       }
 
-      drawTile(t, top, t.h < 0 ? Math.max(t.h, -BASE_THICK + 1) : t.h);
+      let glowColor = null;
+      let glowStrength = 0;
+      if (sw) {
+        const reveal = Math.min(1, prox * SWITCH_REVEAL_MULT);
+        const fade = Math.max(0, Math.min(1, sw.fade));
+        const amount = reveal * reveal * 0.58 * fade;
+        glowColor = ACCENTS[sw.accentIndex];
+        glowStrength = reveal * fade;
+        top = mix(top, glowColor, amount);
+      }
+
+      drawTile(t, top, t.h < 0 ? Math.max(t.h, -BASE_THICK + 1) : t.h, glowColor, glowStrength);
     }
 
     requestAnimationFrame(frame);
   }
 
   // ---- Input ------------------------------------------------------------
+  function pickSwitchTile(x, y) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const sw of switchTiles) {
+      if (sw.removing) continue;
+      const tile = tileByKey.get(tileKey(sw.gx, sw.gy));
+      if (!tile || !hitTile(tile, x, y)) continue;
+      const d = distSq(tile.sx, tile.sy, x, y);
+      if (d < bestDist) {
+        bestDist = d;
+        best = sw;
+      }
+    }
+    return best;
+  }
+
+  function hitTile(t, x, y) {
+    const cy = t.sy - Math.max(0, t.h || 0);
+    const nx = Math.abs(x - t.sx) / (TILE_W * 0.5);
+    const ny = Math.abs(y - cy) / (TILE_H * 0.5);
+    return nx + ny <= 1.1;
+  }
+
+  function isSwitchHovered(t, x, y) {
+    const cy = t.sy - Math.max(0, t.h || 0);
+    const nx = Math.abs(x - t.sx) / (TILE_W * 0.5);
+    const ny = Math.abs(y - cy) / (TILE_H * 0.5);
+    return nx + ny <= 1;
+  }
+
+  function activateSwitchTile(sw) {
+    if (!sw || sw.removing || sw.accentIndex === activeAccentIndex) return;
+    const previousAccentIndex = activeAccentIndex;
+    const nextAccentIndex = sw.accentIndex;
+
+    setActiveAccent(nextAccentIndex);
+    sw.removing = true;
+    sw.fade = Math.min(sw.fade, 1);
+
+    switchTiles = switchTiles.filter((item) =>
+      item === sw || (item.accentIndex !== previousAccentIndex && item.accentIndex !== nextAccentIndex)
+    );
+    addSwitchTile(previousAccentIndex, switchTiles);
+    syncSwitchTiles();
+  }
+
   function setPointer(x, y) {
     pointer.x = x; pointer.y = y; pointer.inside = true;
     if (!interacted) {
@@ -402,23 +641,35 @@
     }
   }
   window.addEventListener("pointermove", (e) => setPointer(e.clientX, e.clientY), { passive: true });
-  window.addEventListener("pointerdown", (e) => setPointer(e.clientX, e.clientY), { passive: true });
+  window.addEventListener("pointerdown", (e) => {
+    setPointer(e.clientX, e.clientY);
+    activateSwitchTile(pickSwitchTile(e.clientX, e.clientY));
+  }, { passive: true });
   window.addEventListener("pointerleave", () => { pointer.inside = false; });
   window.addEventListener("blur", () => { pointer.inside = false; });
 
   // ---- Tab dressing: decoding title -------------------------------------
 
-  // Braille spinners flanking the title, spinning in opposite directions:
-  // "⠏ mtaco ⠹". Static for reduced-motion users.
+  // Two same-direction two-cell braille waves bookend the title, offset from
+  // each other. Static for reduced-motion users.
   function spinTitle() {
     const TITLE = "mtaco";
     if (reduceMotion) { document.title = TITLE; return; }
-    const F = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const BRAILLE_BASE = 0x2800;
+    const F = [
+      "⠉⠁", "⠈⠉", "⠀⠙", "⠀⠸", "⠀⢰", "⠀⣠",
+      "⢀⣀", "⣀⡀", "⣄⠀", "⡆⠀", "⠇⠀", "⠋⠀",
+    ];
+    const mergeCell = (a, b) =>
+      String.fromCharCode(BRAILLE_BASE + ((a.charCodeAt(0) - BRAILLE_BASE) | (b.charCodeAt(0) - BRAILLE_BASE)));
+    const mergePair = (a, b) => mergeCell(a[0], b[0]) + mergeCell(a[1], b[1]);
     const n = F.length;
     let i = 0;
     setInterval(() => {
-      const k = i % n;
-      document.title = F[k] + " " + TITLE + " " + F[n - 1 - k];
+      const primary = F[i % n];
+      const secondary = F[(i + n / 2) % n];
+      const [left, right] = mergePair(primary, secondary);
+      document.title = left + " " + TITLE + " " + right;
       i++;
     }, 90);
   }
